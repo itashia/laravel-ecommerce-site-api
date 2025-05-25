@@ -6,120 +6,135 @@ use App\Models\Api\v1\Product;
 use App\Models\Api\v1\Transaction;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\Log;
+use App\Services\PaymentGatewayService;
 
 class PaymentController extends ApiController
 {
+    protected $paymentGatewayService;
+
+    public function __construct(PaymentGatewayService $paymentGatewayService)
+    {
+        $this->paymentGatewayService = $paymentGatewayService;
+    }
+
+    /**
+     * ارسال اطلاعات به درگاه پرداخت
+     * 
+     * @param Request $request
+     * @return \Illuminate\Http\JsonResponse
+     */
     public function sendInfoToGateway(Request $request)
     {
-        //echo gettype($request);
-        //return $request;
-        $validator = Validator::make($request->all(), [
-            'user_id' => 'required',
-            'order_items' => 'required',
-            'order_items.*.product_id' => 'required|integer',
-            'order_items.*.quantity' => 'required|integer',
-            'request_from' => 'required'
-        ]);
+        $validator = $this->validateRequest($request);
         if ($validator->fails()) {
-            return $this::errorResponse(422,$validator->messages());
+            return $this::errorResponse(422, $validator->messages());
         }
 
+        try {
+            $amounts = $this->calculateOrderAmounts($request->order_items);
+            
+            $paymentResponse = $this->paymentGatewayService->initiatePayment(
+                amount: $amounts['payingAmount'],
+                callback: route('payment.verify'),
+                description: 'پرداخت سفارش',
+                metadata: [
+                    'user_id' => $request->user_id,
+                    'request_from' => $request->request_from
+                ]
+            );
+
+            if ($paymentResponse['status']) {
+                OrderController::create($request, $amounts, $paymentResponse['token']);
+                return $this::successResponse(200, [
+                    'url' => $paymentResponse['payment_url'],
+                    'amounts' => $amounts
+                ]);
+            }
+
+            return $this::errorResponse(422, $paymentResponse['message']);
+
+        } catch (\Exception $e) {
+            Log::error('Payment initiation failed: ' . $e->getMessage());
+            return $this::errorResponse(500, 'خطایی در سرور رخ داده است');
+        }
+    }
+
+    /**
+     * بررسی و تایید تراکنش
+     * 
+     * @param Request $request
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public function verifyTransaction(Request $request)
+    {
+        try {
+            $verificationResponse = $this->paymentGatewayService->verifyPayment($request->token);
+
+            if ($verificationResponse['status'] === 1) {
+                if (Transaction::where('trans_id', $verificationResponse['transId'])->exists()) {
+                    return $this->errorResponse(422, 'این تراکنش قبلا در سیستم ثبت شده است');
+                }
+
+                OrderController::update($request->token, $verificationResponse['transId']);
+                return $this->successResponse(200, null, 'تراکنش با موفقیت انجام شد');
+            }
+
+            return $this->errorResponse(422, 'تراکنش با خطا مواجه شد');
+
+        } catch (\Exception $e) {
+            Log::error('Payment verification failed: ' . $e->getMessage());
+            return $this::errorResponse(500, 'خطایی در تایید تراکنش رخ داده است');
+        }
+    }
+
+    /**
+     * اعتبارسنجی درخواست
+     * 
+     * @param Request $request
+     * @return \Illuminate\Validation\Validator
+     */
+    private function validateRequest(Request $request)
+    {
+        return Validator::make($request->all(), [
+            'user_id' => 'required|integer',
+            'order_items' => 'required|array|min:1',
+            'order_items.*.product_id' => 'required|integer|exists:products,id',
+            'order_items.*.quantity' => 'required|integer|min:1',
+            'request_from' => 'required|string'
+        ], [
+            'order_items.*.product_id.exists' => 'محصول انتخاب شده معتبر نیست',
+            'order_items.*.quantity.min' => 'تعداد محصول باید حداقل ۱ باشد'
+        ]);
+    }
+
+    /**
+     * محاسبه مبالغ سفارش
+     * 
+     * @param array $orderItems
+     * @return array
+     * @throws \Illuminate\Database\Eloquent\ModelNotFoundException
+     */
+    private function calculateOrderAmounts(array $orderItems): array
+    {
         $totalAmount = 0;
         $deliveryAmount = 0;
-        foreach ($request->order_items as $orderItem) {
-//            echo gettype($orderItem['product_id']);
-//            echo "----";
-            //return $orderItem->product_id;
+
+        foreach ($orderItems as $orderItem) {
             $product = Product::findOrFail($orderItem['product_id']);
+            
             if ($product->quantity < $orderItem['quantity']) {
-                return $this::errorResponse(422,'مقدار وارد شده بیشتر از حد مجاز میباشد');
+                throw new \Exception('مقدار وارد شده برای محصول ' . $product->name . ' بیشتر از حد مجاز است');
             }
+
             $totalAmount += $product->price * $orderItem['quantity'];
             $deliveryAmount += $product->delivery_amount;
         }
 
-        $payingAmount = $totalAmount + $deliveryAmount;
-
-        $amounts = [
+        return [
             'totalAmount' => $totalAmount,
             'deliveryAmount' => $deliveryAmount,
-            'payingAmount' => $payingAmount,
+            'payingAmount' => $totalAmount + $deliveryAmount,
         ];
-
-
-        $api = 'test';
-        $amount = $payingAmount;
-        $mobile = "شماره موبایل";
-        $factorNumber = "شماره فاکتور";
-        $description = "توضیحات";
-        //cause php artisan serve can not handle request from web routes to api routes and need server to handle this we use XAMPP
-        $redirect = 'http://localhost/laravelEcommerceSiteApi/public/payment/verify';
-        $result = $this->send($api, $amount, $redirect, $mobile, $factorNumber, $description);
-        $result = json_decode($result);
-        if($result->status) {
-            OrderController::create($request, $amounts, $result->token);
-            $go = "https://pay.ir/pg/$result->token";
-            return $this::successResponse(200,['url'=>$go]);
-        } else {
-            return $this::errorResponse(422,$result->errorMessage);
-        }
-    }
-
-    public function verifyTrans(Request $request){
-        $api = 'test';
-        $token = $request->token;
-        $result = json_decode($this->verify($api,$token));
-        //return response()->json($result);
-        //return $result;
-        if(isset($result->status)){
-            if($result->status == 1){
-                if(Transaction::where('trans_id' , $result->transId)->exists()){
-                    return $this->errorResponse('این تراکنش قبلا توی سیستم ثبت شده است' , 422);
-                }
-                OrderController::update($token, $result->transId);
-                return $this->successResponse(200, null,'تراکنش با موفقیت انجام شد' );
-            } else {
-                echo $this::errorResponse(422,'تراکنش با خطا مواجه شد');
-            }
-        } else {
-            if ($request->status == 0) {
-                return $this->errorResponse(422 ,'تراکنش با خطا مواجه شد' );
-            }
-        }
-    }
-
-    function verify($api, $token) {
-        return $this->curl_post('https://pay.ir/pg/verify', [
-            'api' 	=> $api,
-            'token' => $token,
-        ]);
-    }
-
-    public function send($api, $amount, $redirect, $mobile = null, $factorNumber = null, $description = null) {
-        return $this->curl_post('https://pay.ir/pg/send', [
-            'api'          => $api,
-            'amount'       => $amount,
-            'redirect'     => $redirect,
-            'mobile'       => $mobile,
-            'factorNumber' => $factorNumber,
-            'description'  => $description,
-        ]);
-    }
-
-    function curl_post($url, $params)
-    {
-        $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $url);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($params));
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Content-Type: application/json',
-        ]);
-        $res = curl_exec($ch);
-        curl_close($ch);
-
-        return $res;
     }
 }
