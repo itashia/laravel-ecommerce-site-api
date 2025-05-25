@@ -4,62 +4,140 @@ namespace App\Http\Controllers\Api\v1;
 
 use App\Http\Controllers\Controller;
 use App\Models\Api\v1\User;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Str;
+use Illuminate\Validation\Rules\Password;
+use Symfony\Component\HttpFoundation\Response;
 
 class AuthController extends ApiController
 {
-    public function register(Request $request){
-        $validator = Validator::make($request->all(),[
-            'name'=>'required|string|unique:users,name',
-            'email'=>'required|email|unique:users,email',
-            'password'=>'required|string',
-            'confirmPassword'=>'required|same:password'
+    private const TOKEN_NAME = 'authToken';
+    
+    /**
+     * Register a new user
+     *
+     * @param Request $request
+     * @return JsonResponse
+     * @throws \Illuminate\Validation\ValidationException
+     */
+    public function register(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'name' => 'required|string|max:255|unique:users,name',
+            'email' => 'required|email:rfc,dns|max:255|unique:users,email',
+            'password' => [
+                'required',
+                'string',
+                Password::min(8)
+                    ->mixedCase()
+                    ->numbers()
+                    ->symbols()
+                    ->uncompromised(),
+                'confirmed'
+            ],
         ]);
-
-        if ($validator->fails()){
-            return $this::errorResponse(422,$validator->messages());
-        }
 
         $user = User::create([
-            'name'=>$request->name,
-            'email'=>$request->email,
-            'password'=>Hash::make($request->password),
+            'name' => $validated['name'],
+            'email' => $validated['email'],
+            'password' => Hash::make($validated['password']),
+            'email_verification_token' => Str::random(60),
         ]);
 
-        $token = $user->createToken('myApp')->plainTextToken;
+        // Dispatch email verification job here if needed
 
-        return $this::successResponse(201,['user'=>$user,'token'=>$token],);
+        $token = $user->createToken(self::TOKEN_NAME)->plainTextToken;
+
+        return $this->successResponse(
+            Response::HTTP_CREATED,
+            [
+                'user' => $user->only(['id', 'name', 'email']),
+                'token' => $token,
+            ],
+            'User registered successfully. Please verify your email.'
+        );
     }
 
-    public function login(Request $request){
-        $validator = Validator::make($request->all(),[
-            'email'=>'required|email',
-            'password'=>'required|string',
+    /**
+     * Authenticate user and return token
+     *
+     * @param Request $request
+     * @return JsonResponse
+     */
+    public function login(Request $request): JsonResponse
+    {
+        $credentials = $request->validate([
+            'email' => 'required|email',
+            'password' => 'required|string',
+            'device_name' => 'sometimes|string|max:255',
         ]);
 
-        if ($validator->fails()){
-            return $this::errorResponse(422,$validator->messages());
+        $user = User::where('email', $credentials['email'])->first();
+
+        if (!$user || !Hash::check($credentials['password'], $user->password)) {
+            return $this->errorResponse(
+                Response::HTTP_UNAUTHORIZED,
+                'Invalid credentials',
+                ['email' => ['The provided credentials are incorrect.']]
+            );
         }
 
-        $user = User::where('email',$request->email)->first();
+        // if (!$user->hasVerifiedEmail()) {
+        //     return $this->errorResponse(
+        //         Response::HTTP_FORBIDDEN,
+        //         'Email not verified',
+        //         ['email' => ['Please verify your email address before logging in.']]
+        //     );
+        // }
 
-        if (!$user){
-            return $this::errorResponse(401,'user not found');
-        }
+        $tokenName = $credentials['device_name'] ?? self::TOKEN_NAME;
+        $token = $user->createToken($tokenName)->plainTextToken;
 
-        if (Hash::check($user->password,$request->password)){
-            return $this::errorResponse(401,'incorrect password');
-        };
-
-        $token = $user->createToken('myApp')->plainTextToken;
-
-        return $this::successResponse(201,['user'=>$user,'token'=>$token],);
+        return $this->successResponse(
+            Response::HTTP_OK,
+            [
+                'user' => $user->only(['id', 'name', 'email']),
+                'token' => $token,
+                'token_type' => 'bearer',
+                'expires_in' => config('sanctum.expiration') * 60,
+            ]
+        );
     }
 
-    public function logout(){
-        auth()->user()->tokens()->delete();
-        return $this::successResponse(200,null,'logout');
+    /**
+     * Logout user and revoke tokens
+     *
+     * @param Request $request
+     * @return JsonResponse
+     */
+    public function logout(Request $request): JsonResponse
+    {
+        $request->user()->currentAccessToken()->delete();
+
+        return $this->successResponse(
+            Response::HTTP_OK,
+            null,
+            'Successfully logged out'
+        );
+    }
+
+    /**
+     * Revoke all user tokens
+     *
+     * @param Request $request
+     * @return JsonResponse
+     */
+    public function logoutAllDevices(Request $request): JsonResponse
+    {
+        $request->user()->tokens()->delete();
+
+        return $this->successResponse(
+            Response::HTTP_OK,
+            null,
+            'Successfully logged out from all devices'
+        );
     }
 }
